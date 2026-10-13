@@ -1,0 +1,5 @@
+# Runtime deps for the farmer + 9router connector.
+# The captcha sidecar has its own deps — see README (run_sidecar.py).
+
+cloakbrowser>=0.6.2
+requests>=2.31
