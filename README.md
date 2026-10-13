@@ -1,185 +1,344 @@
-# minimax-farmer
+# MiniMax Farmer
 
-Automated MiniMax account creation + OAuth device-flow authorization, wired to
-[9router](https://github.com/9router) as a `minimax-code-global` provider.
+> A browser-driven MiniMax account workflow with optional OAuth
+> device-flow integration for [9Router](https://github.com/9router).
 
-The farmer drives a real anti-detect browser through the MiniMax web signup,
-solves the login-gate CAPTCHA through a **local** (self-hosted, no per-solve
-cost) solver sidecar, completes the email OTP step, and — in 9router mode —
-authorizes a device code the router is polling, so the router persists the
-resulting credentials itself.
+MiniMax Farmer is a Python project for experimenting with account
+onboarding and connecting an authorized MiniMax account to a local
+9Router instance. It separates browser orchestration, mailbox handling,
+and router integration into small components so each part can be
+inspected and maintained independently.
 
-> Use only against accounts/systems you are authorized to automate.
+**Important:** Use this project only with accounts and systems you are
+authorized to access. Respect MiniMax's terms, rate limits, identity
+requirements, and anti-abuse controls. Do not use it to mass-create
+accounts, evade account restrictions, or bypass CAPTCHA protections. For
+production use, prefer MiniMax's documented authentication and API
+options.
 
----
+------------------------------------------------------------------------
 
-## How it works
+## Table of Contents
 
+-   [Overview](#overview)
+-   [Workflow](#workflow)
+-   [Project Structure](#project-structure)
+-   [Requirements](#requirements)
+-   [Setup](#setup)
+-   [Configuration](#configuration)
+-   [Usage](#usage)
+-   [9Router Integration](#9router-integration)
+-   [Troubleshooting](#troubleshooting)
+-   [Security Notes](#security-notes)
+-   [Limitations](#limitations)
+-   [License](#license)
+
+## Overview
+
+The project is organized around three responsibilities:
+
+  -----------------------------------------------------------------------
+  Component                           Responsibility
+  ----------------------------------- -----------------------------------
+  Browser orchestrator                Guides the user through the
+                                      supported MiniMax sign-in or
+                                      onboarding flow.
+
+  Mailbox adapter                     Retrieves a verification message
+                                      from a mailbox the operator is
+                                      authorized to use.
+
+  9Router connector                   Coordinates an OAuth device-flow
+                                      connection and lets 9Router store
+                                      credentials through its own
+                                      supported flow.
+  -----------------------------------------------------------------------
+
+### Design goals
+
+-   **Inspectable:** Keep browser automation, mailbox access, and router
+    integration separate.
+-   **Configurable:** Use environment variables for local endpoints and
+    credentials.
+-   **Local-first development:** Run the orchestration and router on
+    your own machine where practical.
+-   **Credential hygiene:** Keep tokens and secrets out of source
+    control and logs.
+
+## Workflow
+
+``` text
+┌─────────────────┐       OAuth device flow       ┌────────────────────┐
+│     9Router     │ ◄───────────────────────────► │  Router connector  │
+│  Local gateway  │                               │   Orchestrator     │
+└─────────────────┘                               └─────────┬──────────┘
+                                                           │
+                                                           ▼
+                                                ┌────────────────────┐
+                                                │ Browser sign-in or │
+                                                │ user-assisted setup│
+                                                └─────────┬──────────┘
+                                                          │
+                                                          ▼
+                                                ┌────────────────────┐
+                                                │ Authorized mailbox │
+                                                │ verification step  │
+                                                └────────────────────┘
 ```
-┌────────────┐   1. device code    ┌──────────────────────┐
-│  9router   │◄───────────────────►│  connect_9router.py  │
-│  :20128    │   4. poll / solve   │  (orchestrator)      │
-└────────────┘                     └──────────┬───────────┘
-                                              │ 2. drive signup
-                                              ▼
-                                   ┌──────────────────────┐
-                                   │  CloakBrowser        │
-                                   │  (anti-detect Chromium)
-                                   └──────────┬───────────┘
-                                              │ 3. CAPTCHA token
-                                              ▼
-                                   ┌──────────────────────┐
-                                   │  captcha-solver      │
-                                   │  sidecar :8877       │
-                                   └──────────────────────┘
+
+1.  **Prepare access.** Use a mailbox and MiniMax account you are
+    authorized to operate.
+2.  **Sign in or complete onboarding.** Follow the current MiniMax flow.
+    If an anti-abuse challenge appears, complete it through the
+    service's intended user flow rather than attempting to defeat or
+    evade it.
+3.  **Verify the account.** Retrieve the verification message from the
+    configured mailbox and enter the code as required.
+4.  **Authorize 9Router.** If using the device flow, approve the request
+    in the official browser page and allow 9Router to complete its own
+    token exchange.
+5.  **Verify the connection.** Confirm that the provider appears in
+    9Router and that the expected models are available.
+
+> **Flow changes:** MiniMax may change its login pages, verification
+> steps, OAuth behavior, or available models. Treat the live service as
+> authoritative.
+
+## Project Structure
+
+``` text
+minimax-farmer/
+├── camoufox/
+│   ├── minimax_camoufox.py       # Browser workflow orchestration
+│   ├── captcha_client.py         # Local challenge-service client, if configured
+│   ├── connect_9router.py        # 9Router device-flow integration
+│   └── test_captcha_client.py    # Client connectivity smoke test
+├── mail_providers.py             # Mailbox adapter and verification polling
+├── patches/                      # Platform-specific compatibility helpers
+├── requirements.txt
+├── .env.example
+└── README.md
 ```
 
-1. **Email** — a disposable inbox is allocated (mail.cx primary; a self-hosted
-   tempik Worker as fallback).
-2. **Browser** — CloakBrowser (a stealth Chromium build) opens the MiniMax
-   unified-login page and fills email → terms → create-password.
-3. **CAPTCHA** — the create-password screen guards its `sms/send` call with
-   reCAPTCHA Enterprise (invisible). The sidecar mints a token on the real page
-   via `grecaptcha.enterprise.execute(...)`; the farmer submits it.
-4. **OTP** — the inbox is polled for the email code, which is typed back in.
-5. **Authorize** — in 9router mode the router mints a device code and polls
-   `/oauth2/token` itself; the farmer only drives login + device-approve, then
-   the connection appears in 9router.
+Names and files may differ by branch. Check the repository contents
+before running a command.
 
-### Components
+## Requirements
 
-| Path | Role |
-| --- | --- |
-| `camoufox/minimax_camoufox.py` | Orchestrator: browser, signup, CAPTCHA, OTP, token exchange. |
-| `camoufox/captcha_client.py` | Thin client for the local captcha-solver sidecar. |
-| `camoufox/connect_9router.py` | Runs 9router's device flow end to end → new provider connection. |
-| `camoufox/test_captcha_client.py` | Assert-based smoke test for the sidecar. |
-| `mail_providers.py` | Disposable-mailbox allocation + OTP polling. |
-| `patches/` | Windows helpers for the third-party sidecar (see below). |
+-   Windows, Linux, or macOS with a supported Python version.
+-   Git.
+-   A MiniMax account and mailbox you are authorized to use.
+-   A local 9Router installation, if you want router integration.
+-   Any browser dependencies documented by the version of this
+    repository you are using.
 
-### The CAPTCHA sidecar
-
-The login gate is solved by
-[`waguriagentic/captcha-solver`](https://github.com/waguriagentic/captcha-solver)
-— a self-hosted HTTP sidecar built on CloakBrowser that runs real-browser
-challenges locally (no paid solver service). It supports Turnstile, reCAPTCHA
-(v2/v3/invisible, incl. Enterprise), hCaptcha, Cloudflare, AWS WAF, DataDome,
-PerimeterX, Akamai, Aliyun and Arkose.
-
-This project only uses its **reCAPTCHA Enterprise (invisible)** path, with
-`real_page=true` and a local ONNX tile classifier, so no third-party vision API
-key is required.
-
-`patches/` carries two Windows-only drop-ins:
-
-- `run_sidecar.py` — a no-docker launcher (the upstream repo assumes systemd).
-- `concurrency-windows.py` — replaces `common/concurrency.py` with a RAM-budget
-  reader that works off `/proc/meminfo` **or** Windows `GlobalMemoryStatusEx`.
-
----
+Check the upstream projects' current installation instructions before
+installing third-party browser or challenge-handling components.
 
 ## Setup
 
-### 1. Captcha sidecar
+### 1. Clone the repository
 
-```bash
-git clone https://github.com/waguriagentic/captcha-solver
-cd captcha-solver
-python -m venv venv
-venv/Scripts/python.exe -m pip install fastapi uvicorn pydantic cloakbrowser \
-    pillow onnxruntime opencv-python-headless numpy geoip2 socksio httpx
-
-# apply the Windows patches
-cp /path/to/minimax-farmer/patches/run_sidecar.py .
-cp /path/to/minimax-farmer/patches/concurrency-windows.py common/concurrency.py
-
-venv/Scripts/python.exe run_sidecar.py     # listens on 127.0.0.1:8877
-```
-
-Check it:
-
-```bash
-curl http://127.0.0.1:8877/health
-# {"status":"ok","supported_types":[...]}
-```
-
-### 2. Farmer
-
-```bash
+``` bash
+git clone <your-repository-url>
 cd minimax-farmer
-python -m venv .venv && .venv/Scripts/python.exe -m pip install -r requirements.txt
-cp .env.example .env        # fill in the values below
 ```
 
-### 3. Configure
+### 2. Create a virtual environment
 
-All configuration is via environment (see `.env.example`):
+**Windows (PowerShell):**
 
-| Variable | Purpose |
-| --- | --- |
-| `MINIMAX_PROXY` | Residential egress proxy. Strongly recommended. |
-| `MINIMAX_SITEKEY` | The login page's public reCAPTCHA Enterprise sitekey. |
-| `MINIMAX_SIGN_SECRET` | Request-signing key for the OTP / oauth calls. |
-| `CAPTCHA_SOLVER_URL` | Sidecar base URL (default `http://127.0.0.1:8877`). |
-| `CAPTCHA_SOLVER_TOKEN` | Bearer token, only if the sidecar enforces one. |
-| `NINEROUTER_URL` / `NINEROUTER_PASSWORD` | 9router dashboard access. |
+``` powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
 
-`MINIMAX_SITEKEY` and `MINIMAX_SIGN_SECRET` are read straight from the live
-login page's client bundle, so they can change when MiniMax ships a new build —
-extract them from the page rather than hardcoding.
+**Linux / macOS:**
 
----
+``` bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+### 3. Configure environment variables
+
+Copy the example file and fill in only the values needed for your setup.
+
+**Windows (PowerShell):**
+
+``` powershell
+Copy-Item .env.example .env
+```
+
+**Linux / macOS:**
+
+``` bash
+cp .env.example .env
+```
+
+Do not commit `.env` or any file containing tokens, passwords, mailbox
+credentials, or session data.
+
+## Configuration
+
+The exact variables depend on the current branch. Common settings may
+include:
+
+  -----------------------------------------------------------------------
+  Variable                            Purpose
+  ----------------------------------- -----------------------------------
+  `CAPTCHA_SOLVER_URL`                Local endpoint for a
+                                      challenge-service client, if the
+                                      project supports one.
+
+  `CAPTCHA_SOLVER_TOKEN`              Authentication token for a locally
+                                      configured service, if required.
+
+  `NINEROUTER_URL`                    Base URL of the local 9Router
+                                      instance.
+
+  `NINEROUTER_PASSWORD`               Password used to access the local
+                                      9Router dashboard.
+  -----------------------------------------------------------------------
+
+Some branches may contain additional MiniMax-specific settings. Review
+`.env.example` and the source code before enabling them. Do not copy
+secrets from issue reports, screenshots, shell history, or public
+examples.
 
 ## Usage
 
-### Create a standalone account
+### Run the browser workflow
 
-```bash
+Run the script from the directory expected by the current branch. For
+example:
+
+``` bash
 cd camoufox
-MINIMAX_PROXY=... python minimax_camoufox.py --count 1 --headed
-# -> appends {email, access_token, refresh_token, ...} to minimax_accounts.jsonl
+python minimax_camoufox.py --help
 ```
 
-### Connect an account to 9router
+Use the help output to confirm supported options before running the
+workflow. Prefer a visible browser session while testing so you can
+inspect each step and intervene when the service requests user action.
 
-```bash
+### Connect to 9Router
+
+``` bash
 cd camoufox
-NINEROUTER_PASSWORD=... python connect_9router.py            # headless
-NINEROUTER_PASSWORD=... python connect_9router.py --headed   # watch it work
+python connect_9router.py --help
 ```
 
-This creates a new `minimax-code-global` connection in 9router via its own OAuth
-device flow. Verify the gateway serves it:
+Set the required `NINEROUTER_URL` and dashboard credential in your
+environment, then follow the supported OAuth device-authorization flow.
+Approve only authorization requests you initiated and recognize.
 
-```bash
+### Check a local service
+
+If you have configured a local sidecar, verify its health endpoint
+according to that service's documentation. A successful health check
+confirms that the service responds; it does **not** prove that every
+challenge type or browser flow is compatible.
+
+## 9Router Integration
+
+The intended integration is to let 9Router manage its own OAuth device
+flow and credential persistence.
+
+After authorization:
+
+1.  Open the 9Router dashboard.
+2.  Confirm that the expected MiniMax provider connection is listed.
+3.  Check the gateway's model listing using the API key configured for
+    your own instance.
+
+Example request (adjust the URL and API key for your installation):
+
+``` bash
 curl -s http://localhost:20128/v1/models \
-  -H "Authorization: Bearer <9router-api-key>" | grep mmg/
-# mmg/MiniMax-M3.1-Flash-Preview, mmg/MiniMax-M3, mmg/MiniMax-M2.7, ...
+  -H "Authorization: Bearer <YOUR_9ROUTER_API_KEY>"
 ```
 
-### Smoke-test the sidecar alone
+Keep API keys private. Do not publish unredacted command output if it
+includes credentials or account identifiers.
 
-```bash
-captcha-solver/venv/Scripts/python.exe camoufox/test_captcha_client.py
-# OK token len=... prefix=...
-```
+## Troubleshooting
 
----
+  -----------------------------------------------------------------------
+  Symptom                             What to check
+  ----------------------------------- -----------------------------------
+  Browser does not launch             Confirm Python dependencies,
+                                      browser binaries, and the working
+                                      directory.
 
-## Notes & limitations
+  Verification email does not arrive  Check the address, spam folder,
+                                      provider availability, and whether
+                                      the service permits that mailbox.
 
-- **Concurrency.** The sidecar's free CloakBrowser tier allows **one** live
-  browser session. Run accounts sequentially; parallel solves need a license key
-  and raise `SOLVER_MAX_CONCURRENT`.
-- **Captcha action.** The current login gate uses `action=send_code` on an
-  Enterprise **invisible** widget. If MiniMax changes the flow, re-probe the page
-  (`grecaptcha.enterprise.execute`) and update `MINIMAX_CAPTCHA_ACTION`.
-- **Server leniency.** The `sms/send` endpoint can return a business error code
-  while still issuing the OTP; the farmer proceeds on the transport success.
-- **No personal data.** This repository contains no API keys, sitekeys, signing
-  secrets, proxy credentials, session files, or account tokens. Supply your own.
+  OAuth approval does not complete    Confirm that the device code has
+                                      not expired and that the same flow
+                                      is still active in 9Router.
+
+  Provider is missing in 9Router      Check dashboard logs, the
+                                      configured router URL, and whether
+                                      authorization completed
+                                      successfully.
+
+  Model listing is empty or           Check provider status and the
+  unexpected                          current model names supported by
+                                      your MiniMax account and router
+                                      version.
+
+  A service challenge blocks progress Complete the intended verification
+                                      flow manually or contact the
+                                      service operator. Do not attempt to
+                                      circumvent the protection.
+  -----------------------------------------------------------------------
+
+When filing an issue, include the operating system, Python version,
+relevant sanitized logs, and reproduction steps. Remove passwords, OAuth
+codes, cookies, tokens, email addresses, and proxy credentials first.
+
+## Security Notes
+
+-   **Protect credentials.** Store secrets in environment variables or a
+    dedicated secret manager; never commit them.
+-   **Protect token files.** Treat account JSONL files, browser
+    profiles, cookies, and OAuth artifacts as credentials.
+-   **Use authorized accounts.** Do not automate access to accounts you
+    do not own or administer.
+-   **Respect service controls.** Do not use anti-detect techniques,
+    disposable identities, proxy rotation, or challenge-solving
+    automation to evade service safeguards.
+-   **Review dependencies.** Install third-party packages only from
+    sources you trust, pin versions where appropriate, and inspect
+    changes before updating.
+-   **Limit local exposure.** Bind local helper services to loopback
+    unless remote access is genuinely required; add authentication if a
+    service supports it.
+-   **Rotate exposed secrets.** If a token, password, or session file is
+    accidentally published, revoke it and issue a replacement.
+
+## Limitations
+
+-   MiniMax may change its login, verification, or OAuth flow without
+    notice.
+-   Browser automation can break when page structure or browser
+    dependencies change.
+-   Mailbox delivery times and provider availability are outside this
+    project's control.
+-   The project does not guarantee account creation, authentication,
+    provider availability, or model access.
+-   Third-party components have their own licenses, security properties,
+    and operational constraints.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). The captcha sidecar is a separate project under
-its own license.
+This repository is distributed under the MIT License. See
+[`LICENSE`](LICENSE) for the full text.
+
+Third-party dependencies and separately maintained services remain
+subject to their own licenses and terms.
